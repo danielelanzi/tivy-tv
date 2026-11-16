@@ -1,0 +1,90 @@
+# Copy of deploy/tivy-tv in danielelanzi/tivy: change it there, then copy it here.
+#
+# Publishes the browser version of Tivy on http://tv.dlzero.com/tv/ (ADR 0027).
+# Every 10 minutes it compares the version on tivy-web (public) with the one online here and,
+# if it changed, copies tivy-web's tv folder and publishes it with GitHub Pages.
+# No keys are needed: tivy-web is public and this repository publishes itself.
+name: Publish
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare versions
+        id: version
+        run: |
+          set -euo pipefail
+          latest=$(curl -fsS --max-time 30 https://raw.githubusercontent.com/danielelanzi/tivy-web/main/version.json \
+            | jq -r .version)
+          current=$(cat version.txt 2>/dev/null || true)
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          # Also once a month, to keep the schedule alive (see the last step).
+          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "$latest" != "$current" ] || [ "$age" -gt $((30 * 24 * 3600)) ] \
+            || [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Site
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 https://github.com/danielelanzi/tivy-web.git "$RUNNER_TEMP/web"
+          site="$RUNNER_TEMP/site"
+          mkdir -p "$site"
+          cp -r "$RUNNER_TEMP/web/tv" "$site/tv"
+          touch "$site/.nojekyll"
+          # The app is built for /tv: the bare address opens it.
+          cat > "$site/index.html" <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="0; url=/tv/">
+          <title>Tivy</title>
+          <script>location.replace('/tv/' + location.search + location.hash)</script>
+          <a href="/tv/">Tivy</a>
+          HTML
+          cp "$site/index.html" "$site/404.html"
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.version.outputs.publish == 'true'
+        with:
+          path: ${{ runner.temp }}/site
+
+      - uses: actions/deploy-pages@v4
+        if: steps.version.outputs.publish == 'true'
+
+      # The version published is written here. The commit also keeps the schedule alive:
+      # GitHub stops the schedule of a public repository after 60 days without commits.
+      - name: Remember the version
+        if: steps.version.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.latest }}
+        run: |
+          set -euo pipefail
+          echo "$VERSION" > version.txt
+          date -u +%F > published.txt
+          git add version.txt published.txt
+          git diff --cached --quiet && exit 0
+          git -c user.name="Daniele Lanzi" \
+            -c user.email="57664415+danielelanzi@users.noreply.github.com" \
+            commit -q -m "publish $VERSION"
+          git push -q origin HEAD:main
